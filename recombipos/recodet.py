@@ -7,16 +7,6 @@ from sklearn.cluster import KMeans
 import gzip
 import sys
 
-motherid = sys.argv[2]
-fatherid = sys.argv[3]
-window   = 200
-
-if len(sys.argv) == 5:
-    window   = int(sys.argv[4])
-
-mother = 0
-father = 0
-
 def getGT(info, field):
     tokens = info.split(":")
     gtcol = -1
@@ -25,76 +15,80 @@ def getGT(info, field):
             gtcol = i
             break
     if gtcol == -1:
-        return 0
+        return 3
     gt = field.split(":")[gtcol]
     if len(gt) < 3:
-        return 0
+        return 3
     if gt[0] == gt[2] and gt[0] == '0':
         return 0
-    if gt[0] == '0' and gt[2] != '0':
+    if (gt[0] == '0' and gt[2] == '1') or (gt[0] == '1' and gt[2] == '0'):
         return 1
-    return 2
+    if gt[0] == '1' and gt[2] == '1':
+        return 2
+    return 3
 
-def diffcounter(kmlabels, prevkm):
-    dc = 0
-    for j in range(len(prevkm)):
-        if kmlabels[j] != prevkm[j]:
-            dc += 1
-    return dc
+def recombipos(prevkm, actualkm, sub):
+    (h,w) = sub.shape
+    for i in range(w):
+        for syb in range(h):
+            print(sub[syb,i], end=" ")
 
-def recombipos(classes, prevkm, selected, sub, window):
-    prevgroupmates = list()
+# Normalizing class. K-means some times swap the cluster IDs
+# this method makes the clusters similar to the previous one
+def normclasses(prevkm, actualkm):
+    diff = 0
+    negative = list()
     for i in range(len(prevkm)):
-        if prevkm[i] == prevkm[selected]:
-            prevgroupmates.append(i)
-    thisgroupmates = list()
-    for i in range(len(classes)):
-        if classes[i] == classes[selected]:
-            thisgroupmates.append(i)
-    for i in range(window):
-        same = 0
-        same2 = 0
-        for p in prevgroupmates:
-            if sub[p,i] == sub[selected,i]:
-                same += 1
-        for t in thisgroupmates:
-            if sub[t,i] == sub[selected,i]:
-                same2 += 1
-        ratio1 = float(same) / float(len(prevgroupmates))
-        ratio2 = float(same2) / float(len(thisgroupmates))
-        if ratio2 > ratio1:
-            return i
-    return window
+        if prevkm[i] != actualkm[i]:
+            diff += 1
+        if actualkm[i] == 1:   #FIXME can you make it branchless?
+            negative.append(0)
+        else:
+            negative.append(1)
 
-def processMatrix(matrix, poslist, chrom, window, sybnames):
-    m = np.array(matrix)
-    prevkm = list()
-    for i in range(len(matrix)-window):
-        sub = m[i:i+window,].T
-        pca = PCA(n_components=2)
-        pr  = pca.fit_transform(sub)
-        km  = KMeans(n_clusters = 2, random_state = 0).fit(pr)
-        # KMeans random, so the group ids can be the opposite
-        dc = diffcounter(km.labels_, prevkm)
+    if diff > len(prevkm) / 2:
+        return negative
+    return actualkm
 
-        if dc > 0 and dc < len(prevkm):
-            # we have a recombination, but in which siblings?
-            if dc > len(prevkm) / 2:
-                classes = [int(((x-0.5)*-2)/2.0+0.5) for x in km.labels_]
-            else:
-                classes = km.labels_
-            for j in range(len(classes)):
-                if classes[j] != prevkm[j]:
-                    #print("Recombination in",j,"at",chrom,poslist[i],sybnames[j])
-                    # where is the exact position of the recombination?
-                    index = recombipos(classes, prevkm, j, sub, window)
-                    print(chrom, poslist[i+index], sybnames[j])
-        prevkm = km.labels_
+def processMatrix(matrix, pmatrix, poslist, chrom, window, sybnames):
+    m       = np.array(matrix)
+    prevkm  = list()
+    counter = 0
+    sub     = np.empty([len(sybnames), window])
+    pca     = PCA(n_components = 2)
 
-matrix = list()
+    for i in range(len(matrix)):
+        if pmatrix[i][0] == 1 and (pmatrix[i][1] == 0 or pmatrix[i][1] == 2):
+            for j in range(len(sybnames)):
+                sub[j,counter] = m[i,j]
+            counter += 1
+            if counter == window:
+                # we have enough mutations, lets use it
+                pr = pca.fit_transform(sub)
+                km = KMeans(n_clusters = 2, random_state = 0).fit(pr)
+                classes = normclasses(prevkm, km.labels_)
+                recombipos(prevkm, classes, sub)
+                # prepare for the next cycle
+                counter = 0
+                sub = np.empty([len(sybnames), window])
+                prevkm = classes
+
+##### Main ######
+motherid = sys.argv[2] #T1419022
+fatherid = sys.argv[3] #T2319031
+window   = 200
+
+if len(sys.argv) == 5:
+    window   = int(sys.argv[4])
+
+mother = 0
+father = 0
+
+matrix    = list()
+pmatrix   = list()
 prevchrom = ''
-poslist = list()
-sybnames = list()
+poslist   = list()
+sybnames  = list()
 
 for vcfline in gzip.open(sys.argv[1]):
     line = vcfline.decode('utf-8').rstrip().split("\t")
@@ -114,27 +108,34 @@ for vcfline in gzip.open(sys.argv[1]):
 
     chrom = line[0]
     if prevchrom != chrom and prevchrom != '':
-        processMatrix(matrix, poslist, prevchrom, window, sybnames)
+        processMatrix(matrix, pmatrix, poslist, prevchrom, window, sybnames)
         matrix = list()
         poslist = list()
+        pmatrix = list()
 
     pos   = int(line[1])
     info  = line[8]
     if len(line[3]) > 1 or len(line[4]) > 1:
         continue
 
-    if getGT(info, line[mother]) == 1 and getGT(info, line[father]) == 0:
+    if getGT(info, line[mother]) != 3 and getGT(info, line[father]) != 3:
         row = [0] * (len(line) - 9 - 2)
+        prow = [0,0]
         ri = 0
         for i in range(9, len(line)):
             gt = getGT(line[8], line[i])
-            if i == mother or i == father:
+            if i == mother:
+                prow[0] = gt
+                continue
+            if i == father:
+                prow[1] = gt
                 continue
             row[ri] = gt
             ri += 1
         matrix.append(row)
+        pmatrix.append(prow)
         poslist.append(pos)
 
     prevchrom = chrom
 
-processMatrix(matrix, poslist, prevchrom, window, sybnames)
+processMatrix(matrix, pmatrix, poslist, prevchrom, window, sybnames)
